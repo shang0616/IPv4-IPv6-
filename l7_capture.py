@@ -24,9 +24,12 @@ from mitmproxy import ctx
 def run_mitmproxy(port: int = 8080, pids_file=None, out_file=None) -> subprocess.Popen:
     """启动 mitmdump 子进程, 作为正向代理, 按 pids_file 过滤目标进程 L7 流量。"""
     script = Path(__file__).resolve()
+    # mitmproxy exposes a console entry point; `python -m mitmproxy.tools.main`
+    # is only a module and exits immediately, so call the venv's mitmdump.
+    mitmdump = Path(sys.executable).with_name(
+        "mitmdump.exe" if sys.platform == "win32" else "mitmdump")
     cmd = [
-        sys.executable, "-m", "mitmproxy.tools.main", "mitmdump",
-        "-p", str(port),
+        str(mitmdump), "-p", str(port),
         "-s", str(script),
         "--set", f"pids_file={pids_file}",
         "--set", f"out_file={out_file}",
@@ -109,4 +112,11 @@ class ProcL7Addon:
                 pass
 
 
+# mitmproxy treats a script module itself as the addon and does not pick up an
+# "addon" object variable, so expose the lifecycle hooks at module level.
 addon = ProcL7Addon()
+load = addon.load
+running = addon.running
+request = addon.request
+response = addon.response
+done = addon.done

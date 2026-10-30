@@ -1,6 +1,6 @@
 # proc-sniffer
 
-Capture **one process's network traffic** on Windows — by process name, not by interface.
+Capture **one process's network traffic** on Windows — by process name, not by interface. Both **IPv4 and IPv6** are supported for the L3/L4 join.
 
 Wireshark on Windows cannot filter by process: capture happens below the socket layer, so packets carry no process semantics. `proc-sniffer` solves that by driving **`pktmon`** (built into Windows 10 1809+) for the packets and **`Microsoft-Windows-Kernel-Network`** for the PID, then joining the two — with an optional **mitmproxy** L7 layer that maps source port → PID to dump plaintext HTTP(S) for the target process only.
 
@@ -11,7 +11,7 @@ process name --psutil--> PID / local ports
   L3/L4: pktmon (packets) + Kernel-Network ETW (PID per socket op)
          --> ETL --etl2pcapng--> pcapng --join on 4-tuple--> filtered.pcap
   L7   : mitmproxy (proxy, filter by src port -> PID) --> http_traffic.jsonl
-  export: requests.json / index.md / filtered.pcap / http_traffic.jsonl
+  export: requests.json / index.md / filtered.pcap / streams/ / http_traffic.jsonl
 ```
 
 ## How the PID attribution actually works
@@ -36,7 +36,7 @@ For exact attribution on a VPN'd machine, bind the target's sockets to the physi
 
 | Layer | Tech | Output | Notes |
 |-------|------|--------|-------|
-| L3/L4 | `pktmon` packets + `Kernel-Network` ETW PIDs → `etl2pcap` → join on 4-tuple | `filtered.pcap` + `requests.json` (connection list) | Connection map + raw packets. No decryption. |
+| L3/L4 | `pktmon` packets + `Kernel-Network` ETW PIDs → `etl2pcap` → join on 4-tuple | `filtered.pcap` + `requests.json` + `streams/` | Connection map, raw packets, reassembled TCP/UDP streams. No decryption. |
 | L7 | `mitmproxy` forward proxy, filtered by src-port → PID | `http_traffic.jsonl` (plaintext HTTP req/resp) | Target must use the proxy and trust the mitmproxy CA. |
 
 The `layers` argument picks a layer: `l3` / `l7` / `full` (default: both).
@@ -85,9 +85,32 @@ Output lands in `%PROC_SNIFFER_WORKDIR%\exports\<app_name>\`:
 
 - `requests.json` / `index.md` — L3/L4 connection list
 - `filtered.pcap` — packets belonging to the process, openable in Wireshark
+- `streams/` — reassembled TCP byte streams and UDP datagram flows
 - `http_traffic.jsonl` — L7 plaintext, one `{method,url,req_*,resp_*}` per line
 
 Start the capture first, then perform the action in the app you want to observe.
+
+## Stream reassembly
+
+Every export also writes `streams/`:
+
+```text
+streams/
+  index.json                 metadata, gaps, completeness, file mapping
+  flow-0001-a.tcp.bin        one direction of a TCP stream
+  flow-0002-a.udp.bin        concatenated UDP payloads, one direction
+  flow-0002.udp.jsonl        every UDP datagram with timing and boundaries
+```
+
+IPv4/IPv6 fragments are reassembled before flows are grouped. TCP streams are
+ordered by sequence number; retransmissions and overlapping segments are removed.
+If bytes are missing, the `.bin` is zero-filled and the gap is listed in
+`index.json` (`gaps`, `gap_free`, `complete`). `complete` means the capture saw
+the TCP handshake, a FIN/RST, and no gaps.
+
+UDP has no sequence numbers, so its `.bin` preserves capture order and its
+`.jsonl` preserves datagram boundaries (`payload_b64`, `offset`, `length`, `ts`). Large
+TCP streams are capped at 128 MB; a capped stream is marked `truncated`.
 
 ## L7 notes
 
@@ -126,7 +149,7 @@ Tools:
 | `list_monitorable_apps()` | Process names that currently have network connections |
 | `start_capture(app_name, duration, layers)` | Resolve PIDs and start capture (`l3`/`l7`/`full`) |
 | `stop_capture()` | Stop, convert, filter by process, flush L7 |
-| `export_last(app_name)` | Export the last capture to JSON / pcap / index / jsonl |
+| `export_last(app_name)` | Export the last capture to JSON / pcap / index / streams / jsonl |
 
 Example prompt:
 > "Capture `chrome` for 30 seconds in full mode, export every outbound request including
@@ -156,6 +179,14 @@ captures third-party traffic without permission.
 - **Pinning** — as above, requires Frida.
 - **Private protocols** — if the app speaks QUIC or a binary protocol, L3/L4 gives you
   packets but you still need to reverse the format yourself.
+- **IPv6 address forms** — IPv6 link-local zone IDs from ETW are normalized, and
+  IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are matched as IPv4. The exported
+  connection list keeps the address family as `ip_version` (4 or 6).
+- **TCP gaps** — a capture can start mid-stream or lose packets. Missing bytes are
+  zero-filled in `.bin`; always check `gaps`/`gap_free` in `streams/index.json`
+  before treating a TCP stream as a complete application message.
+- **UDP datagrams are not a byte stream** — use `*.udp.jsonl` when message
+  boundaries matter; `*.udp.bin` is only a concatenation of captured payloads.
 
 ## Legal / ethical use
 

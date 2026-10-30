@@ -44,7 +44,7 @@ def stop_capture() -> str:
 
 @mcp.tool
 def export_last(app_name: str) -> dict:
-    """导出最近一次结果为 requests.json / index.md / filtered.pcap / http_traffic.jsonl"""
+    """导出最近一次结果为 requests.json / index.md / filtered.pcap / streams/ / http_traffic.jsonl"""
     pids = sniffer.resolve_pids(app_name)
     return sniffer.export(app_name, pids)
 

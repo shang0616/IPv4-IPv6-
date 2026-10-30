@@ -6,7 +6,7 @@ proc_sniffer — 按进程名抓取本机网络报文（Windows 10 本机版，�
     L3/L4: pktmon(抓全量) + Kernel-Network(每条 socket 操作带 PID) --> ETL
            --etl2pcapng--> pcapng --按 4 元组 join ETW 的 PID--> filtered.pcap
     L7   : mitmproxy(代理, 按源端口->PID过滤) --> http_traffic.jsonl (HTTP 明文 req/resp)
-    导出 : requests.json / index.md / filtered.pcap / http_traffic.jsonl
+    导出 : requests.json / index.md / filtered.pcap / streams/ / http_traffic.jsonl
 
 说明:
   - pktmon 为 Win10 1809+ 内置。它记录的报文本身不带 PID, pktmon etl2pcap
@@ -14,12 +14,14 @@ proc_sniffer — 按进程名抓取本机网络报文（Windows 10 本机版，�
   - 真正带 PID 的是 Microsoft-Windows-Kernel-Network 这个 ETW provider: 每条
     TCP/UDP send/recv/connect 事件都有 PID + saddr/sport/daddr/dport。所以抓包时
     同时挂上它, 事后用 4 元组把 pcapng 报文 join 到 PID。
+  - L3/L4 同时支持 IPv4 和 IPv6; ETW 的 IPv6 zone id 会在匹配前归一化。
   - ETW 拿不到时回退端口采样(精度低, 短连接可能漏)。
   - L7 明文需目标进程走代理(系统代理或单独设代理), 并信任 mitmproxy CA;
     证书绑定(SSL Pinning)需 Frida 绕过(超出本工具范围, 见 README)。
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import shutil
@@ -31,7 +33,17 @@ from datetime import datetime
 from pathlib import Path
 
 import psutil
-from scapy.all import PcapReader, rdpcap, wrpcap, IP, TCP, UDP
+# Scapy on Windows reads these variables at import time. Some MCP clients
+# launch servers with a minimal environment, so provide standard fallbacks.
+for _var, _default in {
+    "SystemRoot": r"C:\Windows",
+    "WINDIR": r"C:\Windows",
+    "ProgramFiles": r"C:\Program Files",
+    "ProgramFiles(x86)": r"C:\Program Files (x86)",
+    "ProgramW6432": r"C:\Program Files",
+}.items():
+    os.environ.setdefault(_var, _default)
+from scapy.all import PcapReader, rdpcap, wrpcap, IP, IPv6, TCP, UDP
 
 PKTMON = "pktmon"                                  # Win10 1809+ 内置, 需管理员
 ETL2PCAP = "etl2pcap"                               # pktmon 子命令: pktmon etl2pcap <etl> --out <pcapng>
@@ -43,6 +55,45 @@ WORK_DIR = Path(os.environ.get("PROC_SNIFFER_WORKDIR", str(Path.home() / "proc_s
 L7_PROXY_PORT = int(os.environ.get("PROC_SNIFFER_L7_PORT", "8080"))
 # 带 PID 的 ETW provider: 每条 TCP/UDP 收发事件都有 PID + 4 元组
 ETW_PROVIDER = "Microsoft-Windows-Kernel-Network"
+
+
+def _norm_ip(value: str | None) -> str | None:
+    """统一 IPv4/IPv6 文本，便于 ETW 与 pcap 的地址比较。
+
+    ETW 可能带 IPv6 zone id，Windows 双栈 socket 也可能给出 IPv4-mapped
+    地址；这里去掉 zone，并把 ::ffff:a.b.c.d 还原成 IPv4。
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    text = text.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return str(addr.ipv4_mapped)
+    return str(addr)
+
+
+def _ip_layer(pkt):
+    """返回报文的 IPv4/IPv6 层，非 IP 报文返回 None。"""
+    if IP in pkt:
+        return pkt[IP]
+    if IPv6 in pkt:
+        return pkt[IPv6]
+    return None
+
+
+def _l4_layer(pkt):
+    """返回报文的 TCP/UDP 层，其他协议返回 None。"""
+    if TCP in pkt:
+        return pkt[TCP]
+    if UDP in pkt:
+        return pkt[UDP]
+    return None
 
 
 class ProcSniffer:
@@ -63,23 +114,30 @@ class ProcSniffer:
         self._etw_xml: Path | None = None
         self._peer_only = 0
 
-    # ① 软件名 -> PID 列表(模糊匹配 name/exe/cmdline, 含子进程)
+    # ① 软件名 -> PID 列表(精确进程名优先, 否则模糊匹配 name/exe/cmdline)
     def resolve_pids(self, app_name: str) -> list[int]:
         app = app_name.lower()
-        pids: set[int] = set()
+        exact: set[int] = set()
+        fuzzy: set[int] = set()
         for p in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
             try:
                 info = p.info
+                name = (info.get("name") or "").lower()
+                exe = (info.get("exe") or "").lower()
                 hay = " ".join(filter(None, [
-                    (info.get("name") or "").lower(),
-                    (info.get("exe") or "").lower(),
+                    name,
+                    exe,
                     " ".join(info.get("cmdline") or []).lower(),
                 ]))
-                if app in hay:
-                    pids.add(info["pid"])
+                # 避免抓 dwrg 时把命令行里带 "dwrg" 的 shell/Python 也算进来。
+                if (name == app or Path(name).stem == app
+                        or exe == app or Path(exe).stem == app):
+                    exact.add(info["pid"])
+                elif app in hay:
+                    fuzzy.add(info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-        return sorted(pids)
+        return sorted(exact or fuzzy)
 
     # ② 采样指定 PID 使用的本地端口
     def sample_ports(self, pids: set[int]) -> set[int]:
@@ -192,10 +250,12 @@ class ProcSniffer:
         packets = rdpcap(str(src))
         kept = []
         for pkt in packets:
-            if IP in pkt and (TCP in pkt or UDP in pkt):
-                l4 = pkt[TCP] if TCP in pkt else pkt[UDP]
-                if int(l4.sport) in ports or int(l4.dport) in ports:
-                    kept.append(pkt)
+            ip = _ip_layer(pkt)
+            l4 = _l4_layer(pkt)
+            if ip is None or l4 is None:
+                continue
+            if int(l4.sport) in ports or int(l4.dport) in ports:
+                kept.append(pkt)
         wrpcap(str(self._filtered), kept)
         return self._filtered
 
@@ -219,7 +279,9 @@ class ProcSniffer:
             for _, addrs in psutil.net_if_addrs().items():
                 for a in addrs:
                     if a.family in (socket.AF_INET, socket.AF_INET6):
-                        ips.add(a.address.split("%")[0])
+                        ip = _norm_ip(a.address)
+                        if ip:
+                            ips.add(ip)
         except Exception:
             pass
         return ips
@@ -239,8 +301,13 @@ class ProcSniffer:
                 continue
             d = {x.get("Name"): (x.text or "").strip()
                  for x in el.findall(ns + "EventData/" + ns + "Data")}
+            saddr = _norm_ip(d.get("saddr"))
+            daddr = _norm_ip(d.get("daddr"))
+            if not saddr or not daddr:
+                el.clear()
+                continue
             try:
-                key = (d["saddr"], int(d["sport"]), d["daddr"], int(d["dport"]))
+                key = (saddr, int(d["sport"]), daddr, int(d["dport"]))
                 m.setdefault(key, set()).add(int(d["PID"]))
             except (KeyError, ValueError):
                 pass
@@ -277,28 +344,32 @@ class ProcSniffer:
         seen = set()
         peer_only = 0
         # 流式读, 512MB 的抓包也不会一次进内存
-        for pkt in PcapReader(str(self._pcapng)):
-            if IP not in pkt or not (TCP in pkt or UDP in pkt):
-                continue
-            l4 = pkt[TCP] if TCP in pkt else pkt[UDP]
-            src, sport = pkt[IP].src, int(l4.sport)
-            dst, dport = pkt[IP].dst, int(l4.dport)
-            exact_hit = (src, sport) in exact or (dst, dport) in exact
-            if not exact_hit:
-                # 端点对不上, 退一步按对端 ip 匹配(NAT/VPN 改写端口时唯一的线索)
-                if not (src in peer or dst in peer):
+        with PcapReader(str(self._pcapng)) as reader:
+            for pkt in reader:
+                ip = _ip_layer(pkt)
+                l4 = _l4_layer(pkt)
+                if ip is None or l4 is None:
                     continue
-                peer_only += 1
-            # pktmon 会在协议栈每一层各记一份同一报文, 去重后再落盘
-            if TCP in pkt:
-                key = (src, sport, dst, dport, int(l4.seq), int(l4.ack),
-                       str(l4.flags), len(bytes(l4.payload)))
-            else:
-                key = (src, sport, dst, dport, bytes(l4.payload))
-            if key in seen:
-                continue
-            seen.add(key)
-            kept.append(pkt)
+                src, dst = _norm_ip(ip.src), _norm_ip(ip.dst)
+                if not src or not dst:
+                    continue
+                sport, dport = int(l4.sport), int(l4.dport)
+                exact_hit = (src, sport) in exact or (dst, dport) in exact
+                if not exact_hit:
+                    # 端点对不上, 退一步按对端 ip 匹配(NAT/VPN 改写端口时唯一的线索)
+                    if not (src in peer or dst in peer):
+                        continue
+                    peer_only += 1
+                # pktmon 会在协议栈每一层各记一份同一报文, 去重后再落盘
+                if TCP in pkt:
+                    key = (src, sport, dst, dport, int(l4.seq), int(l4.ack),
+                           str(l4.flags), len(bytes(l4.payload)))
+                else:
+                    key = (src, sport, dst, dport, bytes(l4.payload))
+                if key in seen:
+                    continue
+                seen.add(key)
+                kept.append(pkt)
         self._peer_only = peer_only
         wrpcap(str(self._filtered), kept)
         return self._filtered
@@ -311,13 +382,25 @@ class ProcSniffer:
         packets = rdpcap(str(self._filtered)) if self._filtered.exists() else []
         conns: dict = {}
         for pkt in packets:
-            if IP in pkt and (TCP in pkt or UDP in pkt):
-                l4 = pkt[TCP] if TCP in pkt else pkt[UDP]
-                key = (pkt[IP].src, int(l4.sport), pkt[IP].dst, int(l4.dport),
-                       "TCP" if TCP in pkt else "UDP")
-                c = conns.setdefault(key, {"packets": 0, "bytes": 0})
-                c["packets"] += 1
-                c["bytes"] += len(pkt)
+            ip = _ip_layer(pkt)
+            l4 = _l4_layer(pkt)
+            if ip is None or l4 is None:
+                continue
+            version = 6 if isinstance(ip, IPv6) else 4
+            proto = "TCP" if TCP in pkt else "UDP"
+            key = (ip.src, int(l4.sport), ip.dst, int(l4.dport), proto, version)
+            c = conns.setdefault(key, {"packets": 0, "bytes": 0,
+                                       "ip_version": version})
+            c["packets"] += 1
+            c["bytes"] += len(pkt)
+        ipv4_connections = sum(1 for v in conns.values() if v["ip_version"] == 4)
+        ipv6_connections = sum(1 for v in conns.values() if v["ip_version"] == 6)
+        try:
+            from stream_export import export_streams
+            stream_info = export_streams(packets, out / "streams")
+        except Exception:
+            import traceback
+            stream_info = {"error": traceback.format_exc()}
         stats = {
             "app_name": app_name,
             "pids": pids,
@@ -326,10 +409,14 @@ class ProcSniffer:
                             else "port-sample"),
             # 走 VPN/NAT 时只能按对端 ip 匹配, 这一部分可能混入同服务器的其他进程流量
             "peer_only_packets": self._peer_only,
+            "ipv4_connections": ipv4_connections,
+            "ipv6_connections": ipv6_connections,
+            "streams": stream_info,
             "connections": [
                 {"src": s, "sport": sp, "dst": d, "dport": dp, "proto": pr,
+                 "ip_version": v["ip_version"],
                  "packets": v["packets"], "bytes": v["bytes"]}
-                for (s, sp, d, dp, pr), v in conns.items()
+                for (s, sp, d, dp, pr, _), v in conns.items()
             ],
         }
         (out / "requests.json").write_text(
@@ -341,6 +428,19 @@ class ProcSniffer:
             f"- PID: {pids}",
             f"- 归因方式: {stats['attribution']}",
             f"- L3/L4 连接数: {len(stats['connections'])}",
+            f"- IPv4 连接数: {ipv4_connections}",
+            f"- IPv6 连接数: {ipv6_connections}",
+        ]
+        if "error" in stream_info:
+            lines.append("- 数据流重组: 失败（见 requests.json）")
+        else:
+            lines += [
+                f"- 重组数据流: {stream_info.get('flows', 0)} 条"
+                f"（TCP {stream_info.get('tcp_flows', 0)} / UDP {stream_info.get('udp_flows', 0)}）",
+                f"- 数据流目录: [streams/index.json](streams/index.json)"
+                f"（共 {stream_info.get('payload_bytes', 0)} 字节）",
+            ]
+        lines += [
             f"- L7 HTTP 记录数: {self._count_http()}",
             "",
         ]
@@ -353,12 +453,13 @@ class ProcSniffer:
             ]
         lines += [
             "## L3/L4 连接清单", "",
-            "| 源 | 源端口 | 目的 | 目的端口 | 协议 | 包数 | 字节 |",
-            "|---|---|---|---|---|---|---|",
+            "| 源 | 源端口 | 目的 | 目的端口 | 协议 | IP版本 | 包数 | 字节 |",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for c in stats["connections"]:
             lines.append(
-                f"| {c['src']} | {c['sport']} | {c['dst']} | {c['dport']} | {c['proto']} | {c['packets']} | {c['bytes']} |")
+                f"| {c['src']} | {c['sport']} | {c['dst']} | {c['dport']} | "
+                f"{c['proto']} | IPv{c['ip_version']} | {c['packets']} | {c['bytes']} |")
         (out / "index.md").write_text("\n".join(lines), encoding="utf-8")
         # 复制产物
         if self._filtered.exists():
@@ -371,6 +472,12 @@ class ProcSniffer:
             "pcap": str(out / "filtered.pcap"),
             "http": str(out / "http_traffic.jsonl") if self._http.exists() else None,
             "connections": len(stats["connections"]),
+            "ipv4_connections": ipv4_connections,
+            "ipv6_connections": ipv6_connections,
+            "streams": stream_info.get("dir"),
+            "stream_count": stream_info.get("flows", 0),
+            "tcp_streams": stream_info.get("tcp_streams", 0),
+            "udp_streams": stream_info.get("udp_streams", 0),
             "http_records": self._count_http(),
             "attribution": stats["attribution"],
             "peer_only_packets": self._peer_only,
