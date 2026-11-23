@@ -163,8 +163,7 @@ endpoint map, or a reproducible capture script for your team — I take paid cus
 **Scope:** software you own or are authorized to analyze. I do not take work that
 captures third-party traffic without permission.
 
-**Contact:** open an issue with `[custom]` in the title, or email
-[2515196022@qq.com](mailto:2515196022@qq.com?subject=%5Bcustom%20capture%5D).
+
 
 ## Limitations
 
@@ -199,3 +198,4 @@ No warranty — see [LICENSE](LICENSE).
 ## License
 
 MIT.
+
