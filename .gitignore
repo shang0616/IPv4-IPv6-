@@ -15,6 +15,7 @@ venv/
 proc_sniffer_caps/
 exports/
 captures/
+installers/
 
 # Editors / OS
 .vscode/

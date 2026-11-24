@@ -24,12 +24,13 @@ This is the part most tools get wrong, so it is worth being precise:
 
 So the capture runs `pktmon start --capture --trace --provider Microsoft-Windows-Kernel-Network`, and the ETL ends up holding both the packets and the PID-tagged socket events. `tracerpt` exports the events to XML, `pktmon etl2pcap` exports the packets to pcapng, and the tool joins them on the 4-tuple.
 
-Two limits of that join, both reported in the export:
+The export distinguishes the evidence behind that join:
 
-- **`exact`** — the local `(ip, port)` endpoint was seen for the target PID. Precise.
-- **`peer`** — only the remote IP matches. This happens when the machine routes through a VPN/TUN adapter: ETW sees the tunnel-side 4-tuple, the physical NIC sees a NAT-rewritten one. The export counts these packets in `peer_only_packets` and warns in `index.md`, because traffic from *other* processes to the same server can leak in.
+- **`exact`** — protocol and both IP/port endpoints match ETW records whose observed owners are all target PIDs. This is tuple evidence, not a per-packet PID; time-based port/PID reuse is still a limitation.
+- **`tuple_only`**, **`endpoint_only`**, **`peer_only`** — progressively weaker matches (unknown protocol/shared ownership, one local endpoint, or only the remote IP). `attribution_counts` reports each category; `packet_count` reports the total retained capture records. A remote-IP match can occur with VPN/NAT, but does not prove NAT caused it; other processes' traffic can enter these categories.
+- **`port_sample`** — fallback when usable ETW records are unavailable. Matching only a sampled port can miss short connections and include unrelated endpoints.
 
-For exact attribution on a VPN'd machine, bind the target's sockets to the physical adapter, or run the capture without the tunnel.
+To reduce NAT ambiguity, bind the target's sockets to the physical adapter or capture without the tunnel. This does not eliminate time-based tuple reuse or the other attribution limits.
 
 
 ## Two layers
@@ -102,15 +103,41 @@ streams/
   flow-0002.udp.jsonl        every UDP datagram with timing and boundaries
 ```
 
-IPv4/IPv6 fragments are reassembled before flows are grouped. TCP streams are
-ordered by sequence number; retransmissions and overlapping segments are removed.
-If bytes are missing, the `.bin` is zero-filled and the gap is listed in
-`index.json` (`gaps`, `gap_free`, `complete`). `complete` means the capture saw
-the TCP handshake, a FIN/RST, and no gaps.
+Complete IPv4/IPv6 fragment groups are reassembled before flows are grouped.
+Incomplete, conflicting or ambiguously reused groups are discarded and counted;
+missing fragments are never synthesized as real payload. Identical fragment
+copies can be combined, but identical complete UDP datagrams are retained.
 
-UDP has no sequence numbers, so its `.bin` preserves capture order and its
-`.jsonl` preserves datagram boundaries (`payload_b64`, `offset`, `length`, `ts`). Large
-TCP streams are capped at 128 MB; a capped stream is marked `truncated`.
+TCP streams use sequence numbers and keep the first captured byte on overlap.
+Missing bytes (including snap-length truncation and missing data before FIN)
+are zero-filled and listed in `gaps`. Per-direction `complete` requires observed
+SYN/FIN boundaries, no gaps, no conflicts, and no export truncation; it does not
+certify an application's message, the full handshake, or a successful login.
+RST alone cannot certify completeness. A new observed SYN separates reused
+four-tuples; reuse without a SYN and sequence spans of 2 GiB or more are still
+ambiguous. `capture_truncated_packets` reports capture truncation separately
+from the output size limit.
+
+UDP `.bin` preserves capture order; `.udp.jsonl` preserves datagram boundaries
+and captured/declared lengths, `missing_bytes`, `complete`, and `truncated`.
+Both TCP and UDP output are capped at 128 MiB per direction. The cap does not
+bound total packet or metadata memory. Treat zero-filled gaps and partial
+compressed/encrypted records as missing evidence, not recovered plaintext.
+
+## Campus one-command capture
+
+On Windows, run `campus_capture.cmd` after joining the target network. It requests
+administrator rights, opens `http://neverssl.com`, captures for 60 seconds, stops,
+and exports a uniquely named pcapng plus a command log under `captures/campus/`.
+Optional arguments: `-Seconds 120`, `-NoBrowser`, `-NoPause`.
+
+The script and L3 capture use `--pkt-size 0 --comp nics --type flow`: full frames,
+with fewer protocol-stack copies. NIC traffic includes received broadcast and
+multicast; it is not restricted to one application. Multiple adapters may still
+record copies, and NIC-only capture can omit loopback/internal stack traffic.
+Existing pktmon filters are not cleared. A 512 MiB circular ETL can overwrite its
+oldest records. Do not interpret pktmon drop-event counts as capture loss without
+checking ETW loss and per-frame captured/original lengths.
 
 ## L7 notes
 
@@ -164,7 +191,6 @@ endpoint map, or a reproducible capture script for your team — I take paid cus
 captures third-party traffic without permission.
 
 
-
 ## Limitations
 
 - **L3/L4 does not decrypt HTTPS** — you get encrypted TLS bytes, not request bodies.
@@ -198,4 +224,3 @@ No warranty — see [LICENSE](LICENSE).
 ## License
 
 MIT.
-

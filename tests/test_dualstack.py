@@ -21,12 +21,15 @@ EVENT_NS = "http://schemas.microsoft.com/win/2004/08/events/event"
 PROVIDER = "Microsoft-Windows-Kernel-Network"
 
 
-def write_etw(path: Path, pid: int, tuples: list[tuple[str, int, str, int]]) -> None:
+def write_etw(path: Path, pid: int, tuples: list[tuple[str, int, str, int]],
+              event_id: int | None = 10) -> None:
     root = ET.Element("Events")
     for saddr, sport, daddr, dport in tuples:
         event = ET.SubElement(root, f"{{{EVENT_NS}}}Event")
         system = ET.SubElement(event, f"{{{EVENT_NS}}}System")
         ET.SubElement(system, f"{{{EVENT_NS}}}Provider", {"Name": PROVIDER})
+        if event_id is not None:
+            ET.SubElement(system, f"{{{EVENT_NS}}}EventID").text = str(event_id)
         data = ET.SubElement(event, f"{{{EVENT_NS}}}EventData")
         for name, value in (
             ("PID", str(pid)),

@@ -41,7 +41,7 @@ D:\proc-sniffer\.venv\Scripts\python.exe
 以**管理员身份**打开 PowerShell 或 Windows Terminal：
 
 ```powershell
-cd /d D:\proc-sniffer
+Set-Location D:\proc-sniffer
 $env:PROC_SNIFFER_WORKDIR = "D:\proc-sniffer\captures"
 
 # 抓 chrome 的 L3/L4，30 秒
@@ -82,10 +82,7 @@ MCP 方式同理：**要执行抓包，MCP 客户端或服务进程必须具备�
 | `[秒数]` | 抓取时长，默认 30 秒 |
 | `[l3 / l7 / full]` | `l3` 只抓报文；`l7` 只抓 HTTP 明文；`full` 两者都开（默认） |
 
-注意：
-
-- 工具没有 `--help` 参数；不带参数运行会打印用法。
-- 不要把 `--help` 当作参数试探。它会被当成进程名，触发一次 30 秒抓取。
+可以运行 `python proc_sniffer.py --help` 查看帮助，不会启动采集。CLI 的秒数必须大于 0；MCP/API 的 `duration=0` 表示手动停止。非法参数会在解析进程或启动采集前报错。
 
 ### 5.2 常用示例
 
@@ -124,10 +121,10 @@ C:\Users\MECHREVO\proc_sniffer_caps\exports\<进程名>\
 | `requests.json` | L3/L4 连接清单和统计；**不是** HTTP 请求正文；每条连接带 `ip_version`（4 或 6） |
 | `index.md` | 可读的抓取摘要、连接表、IPv4/IPv6 连接数、归因警告 |
 | `filtered.pcap` | 按 PID 过滤后的报文，可用 Wireshark 打开；包含 IPv4 和 IPv6 |
-| `streams/` | 完整重组后的 TCP 字节流和 UDP 数据报流 |
+| `streams/` | TCP 字节流和 UDP 数据报；是否完整须检查缺口、截断和冲突标记 |
 | `http_traffic.jsonl` | L7 明文请求/响应；仅 L7 或 full 且代理生效时生成 |
 
-`requests.json` 里的 `attribution` 表示 ETW XML 是否生成，并不保证每条连接都精确归属；请同时看 `peer_only_packets` 和 `index.md` 的提示。
+`requests.json` 的 `attribution` 表示实际使用的归因来源：`etw` / `port-sample` / `none`。`attribution_counts` 分别报告 `exact`、`tuple_only`、`endpoint_only`、`peer_only`、`port_sample`。只有协议及双端 IP/端口与目标 PID 的 ETW 记录相符才标 `exact`；它仍是整个采集时段的元组证据，不是每包自带 PID，也未完全排除端口/PID 复用。
 
 ### 5.4 数据流重组
 
@@ -141,15 +138,16 @@ streams/
   flow-0002.udp.jsonl        UDP 每个数据报的时间、方向和边界
 ```
 
-IPv4/IPv6 分片会在分组前先重组。
+IPv4/IPv6 完整分片组会在分流前重组；缺片、冲突重叠、截断或 ID 复用导致不明确的组会丢弃并计数，不能补造真实 payload。相同分片副本允许合并；完整 UDP 数据报即使内容相同也会保留。
 
 **TCP：**
 
-- 按 TCP 序号排序，不按抓包顺序。
-- 自动去掉重传和重叠字节。
-- 抓包中缺失的字节会在 `.bin` 中补 `0x00`，并在 `index.json` 的 `gaps` 中列出。
-- `gap_free: true` 表示没有缺口；`complete: true` 还要求抓到了握手、FIN/RST，且没有缺口。
-- `retransmissions`、`conflicting_segments` 会记录重传和内容冲突的数量。
+- 按 TCP 序号定位；有重叠时保留最先捕获的字节，并记录冲突。
+- 重传不重复拼接；新的 SYN 将同一四元组的新连接分开。没有 SYN 的复用及跨度达到 2 GiB 的序号仍有歧义。
+- 缺失字节（含抓包截断和 FIN 前尾部缺失）补 `0x00`，在 `gaps` 中列出。
+- `gap_free: true` 只表示重组窗口没有缺口。每方向的 `complete: true` 还要求观察到 SYN/FIN 边界、无冲突和导出截断；它不证明完整三次握手、应用消息完整或认证成功。RST 不能单独证明完整。
+- `capture_truncated_packets` 记录采集时截短的包；`truncated` 表示重组输出达到大小上限。缺失字节被完整重传补齐时，仍可形成无缺口输出。
+- `retransmissions`、`conflicting_segments` 记录重传和冲突段。
 
 **UDP：**
 
@@ -157,7 +155,7 @@ IPv4/IPv6 分片会在分组前先重组。
 - 需要保留消息边界时，用 `flow-XXXX.udp.jsonl`；每行包含 `offset`、`length`、`ts`、`direction` 和 `payload_b64`，`offset` 可直接对应到同方向的 `.bin`。
 - 游戏战斗 UDP 这类二进制协议，建议直接分析 `.jsonl` 里的 base64 数据，或从 `.bin` 按长度切分。
 
-> TCP `.bin` 中出现 `0x00` 不一定是真实数据，可能是缺口填充；先检查 `gaps`/`gap_free` 再下结论。单个 TCP 流最多重组 128 MB，超过会标记 `truncated`。
+> TCP `.bin` 中的 `0x00` 可能是缺口填充；先检查 `gaps`/`gap_free`。UDP 也会标记 `declared_length`、`captured_length`、`missing_bytes`、`complete` 和 `truncated`。TCP/UDP 每方向导出最多 128 MiB；这不限制整个抓包及索引所需的内存。不能把有缺口的 gzip/TLS 数据硬拼后当作可靠明文。
 
 ## 6. L7 明文抓取
 
@@ -179,7 +177,7 @@ $env:PROC_SNIFFER_L7_PORT = "8081"
 
 设置后，目标进程的代理也要改成 `127.0.0.1:8081`。
 
-> L7 子进程的日志被重定向到了空设备。端口被占用时可能表现为“抓取仍在跑，但没有 `http_traffic.jsonl`”，所以先检查端口。
+> L7 只监听 `127.0.0.1`。启动时通过私有状态文件确认 addon 初始化；端口被占用、进程提前退出、日志文件不可写或初始化超时会报错。归因同时核对客户端和代理的 IP/端口与 PID；实时 psutil 查询仍可能漏掉已经结束的短连接。
 
 ### 6.2 第二步：让目标走代理
 
@@ -275,7 +273,7 @@ Start-Process "$env:USERPROFILE\.mitmproxy\mitmproxy-ca-cert.p12"
 要让抓包成功，客户端进程必须有管理员权限。可以先用管理员终端手工验证服务能否启动：
 
 ```powershell
-cd /d D:\proc-sniffer
+Set-Location D:\proc-sniffer
 .\.venv\Scripts\python.exe server.py
 ```
 
@@ -341,7 +339,7 @@ $env:PROC_SNIFFER_WORKDIR = "D:\proc-sniffer\captures"
 
 ### 9.3 VPN / NAT 的精度下降
 
-走 VPN/TUN 时，ETW 和物理网卡看到的 4 元组可能不一致，工具会退化为按“对端 IP”匹配：
+ETW 和物理网卡看到的元组可能不同，工具保留端点/对端 IP 弱匹配，并单独标记；VPN/NAT 是可能原因之一，不能仅凭弱匹配数量断言使用了 VPN：
 
 - 看 `index.md` 里的 `peer_only_packets`。
 - 该数值非 0 时，结果可能混入其他进程发往同一服务器的流量。
@@ -349,7 +347,7 @@ $env:PROC_SNIFFER_WORKDIR = "D:\proc-sniffer\captures"
 
 ### 9.4 磁盘占用
 
-`pktmon` 会先抓取全机流量再过滤。ETL 上限约为 512 MB，但生成的 `capture.pcapng` 和 `etw_network.xml` 可能达到数百 MB 甚至更大。
+`pktmon` 先抓网卡流量再过滤，使用 `--pkt-size 0 --comp nics --type flow` 完整保存帧并减少协议栈副本。它包含网卡收到的广播/多播；多网卡仍可能重复采集，纯回环或协议栈内部流量可能看不到。既有 pktmon 筛选器不会自动清除。ETL 采用 512 MiB 循环日志，达到上限会覆盖最早记录；转换后的 pcapng/XML 可能更大。
 
 建议：
 
@@ -431,7 +429,7 @@ Remove-Item "D:\proc-sniffer\captures" -Recurse -Force
 查看修改：
 
 ```powershell
-cd /d D:\proc-sniffer
+Set-Location D:\proc-sniffer
 git diff
 ```
 
@@ -440,7 +438,7 @@ git diff
 ## 13. 快速自检
 
 ```powershell
-cd /d D:\proc-sniffer
+Set-Location D:\proc-sniffer
 
 # 依赖是否正常
 .\.venv\Scripts\python.exe -m pip check
@@ -455,4 +453,18 @@ pktmon status
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-以上检查都正常，就可以按第 3 节开始抓包。
+以上是依赖和离线回归检查，不代替管理员权限下的实际采集验证。当前审查结论见 [AUDIT.md](D:/proc-sniffer/AUDIT.md)。
+
+## 14. 校园网一键采集
+
+```powershell
+D:\proc-sniffer\campus_capture.cmd
+# 可选：延长到 120 秒、不自动打开浏览器
+D:\proc-sniffer\campus_capture.cmd -Seconds 120 -NoBrowser
+```
+
+默认抓取 60 秒，自动停止和转换，在 `captures/campus/` 下输出唯一命名的 pcapng 和命令日志。脚本先申请管理员权限，沿用并记录 pktmon 全局筛选器，不会为了启动而先停掉其他抓包。启动、停止或转换失败将返回非零退出码，不再只因文件存在就报告成功。
+
+`--pkt-size 0` 表示保存完整帧。1500 是常见 IP MTU，不是所有以太网帧的总长度；旧脚本截短大包后生成的文件无法补回丢失字节。分析前检查 `frame.cap_len < frame.len`，不要把 pktmon 的“丢弃计数”直接解释为抓包漏包或广播拥塞。
+
+可以按一次授权测试操作后等待自动结束。脚本无需安装 Npcap，不修改网络连接、代理、证书或持久环境变量。窗口强制关闭或进程被强制终止时，`finally` 无法保证执行，需另行检查 `pktmon status`。
